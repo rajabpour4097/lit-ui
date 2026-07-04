@@ -1,0 +1,514 @@
+================================================================================
+                    LIT-UI — مستند جامع پروژه برای تحلیل
+         Liquidity Intelligence Trading — سیستم تحلیل نقدینگی و سیگنال ورود
+================================================================================
+
+تاریخ مستند: 2026
+مسیر پروژه: LIT-UI
+زبان پیاده‌سازی: Python 3
+فریم‌ورک UI: Django
+منبع داده: MetaTrader 5 (MT5) — فقط خواندن OHLC
+
+================================================================================
+۱. خلاصه اجرایی (Executive Summary)
+================================================================================
+
+این پروژه یک سیستم تحلیل بازار مبتنی بر «نقدینگی» (Liquidity) است که:
+
+  • ساختار بازار (سویینگ‌ها) را تشخیص می‌دهد
+  • زون‌های نقدینگی (Liquidity Zones) می‌سازد
+  • رویدادهای جاروب نقدینگی (Liquidity Sweeps) را شناسایی می‌کند
+  • در لایه بالاتر، سیگنال‌های ورود معاملاتی ساختاریافته تولید می‌کند
+  • یک داشبورد فارسی RTL برای نمایش نتایج دارد
+
+این سیستم ربات معامله‌گر نیست — لایه تشخیص و سیگنال است، نه اجرای سفارش.
+
+سه لایه اصلی:
+
+  [MT5 Terminal] → [Django + data_access] → [liquidity_zone_engine]
+                                              ↓
+                                    [lit_entry_trigger_engine]
+                                              ↓
+                                    [Dashboard فارسی / API]
+
+================================================================================
+۲. ساختار فایل‌ها و پوشه‌ها
+================================================================================
+
+LIT-UI/
+│
+├── manage.py                          ← اجرای Django
+├── requirements.txt                   ← وابستگی‌ها (pandas, Django, MT5, ...)
+│
+├── config/                            ← تنظیمات Django
+│   ├── settings.py
+│   └── urls.py
+│
+├── dashboard/                         ← لایه UI و اتصال داده
+│   ├── views.py                       ← liquidity_dashboard
+│   ├── urls.py                        ← /dashboard/liquidity/
+│   └── data_access.py                 ← get_ohlc_data(symbol, timeframe)
+│
+├── templates/liquidity/
+│   └── dashboard.html                 ← داشبورد فارسی RTL
+│
+├── static/css/
+│   └── liquidity.css                  ← تم تیره trading dashboard
+│
+├── liquidity_zone_engine/             ← موتور تحلیل نقدینگی (هسته)
+│   ├── __init__.py                    ← API عمومی + test_engine()
+│   ├── engine.py                      ← full_analysis()
+│   ├── structure.py                   ← detect_swings()
+│   ├── zones.py                       ← build_zones()
+│   ├── sweeps.py                      ← detect_sweeps()
+│   ├── atr.py                         ← محاسبه ATR
+│   ├── config.py                      ← پارامترهای پیش‌فرض
+│   ├── utils.py                       ← نرمال‌سازی OHLC
+│   └── sample_data.py                 ← داده مصنوعی برای تست آفلاین
+│
+├── lit_entry_trigger_engine.py        ← لایه سیگنال ورود (روی تحلیل)
+│
+└── LIT_PROJECT_OVERVIEW_FA.txt        ← همین فایل
+
+================================================================================
+۳. جریان داده (Data Flow)
+================================================================================
+
+مرحله ۱ — دریافت داده
+  • MetaTrader 5 Terminal باید باز و لاگین باشد
+  • تابع get_ohlc_data(symbol, timeframe) در dashboard/data_access.py
+  • از mt5.copy_rates_from_pos خواندن read-only انجام می‌شود
+  • خروجی: DataFrame با ستون‌های open, high, low, close, timestamp
+  • تایم‌فریم‌های پشتیبانی‌شده: D1, H4, H1, M15, M5
+  • نمادهای پیش‌فرض: EURUSD, XAUUSD, GBPUSD
+
+مرحله ۲ — تحلیل نقدینگی
+  • full_analysis(df, timeframe=...) در liquidity_zone_engine
+  • خروجی یک dict با کلیدهای zones, swings, sweeps
+
+مرحله ۳ — تولید سیگنال ورود (اختیاری)
+  • detect_entries(analysis) در lit_entry_trigger_engine
+  • خروجی: dict با کلید entries (لیست setupهای buy/sell)
+
+مرحله ۴ — نمایش UI
+  • Django view نتیجه full_analysis را به template فارسی می‌فرستد
+  • UI هیچ محاسبه بازار انجام نمی‌دهد — فقط نمایش
+
+================================================================================
+۴. ماژول liquidity_zone_engine — موتور تحلیل
+================================================================================
+
+هدف: تشخیص ساختار نقدینگی بازار با نویز پایین و دقت بالا.
+وابستگی: فقط pandas/numpy — بدون ML و بدون API خارجی.
+
+--------------------------------------------------------------------------------
+۴.۱ API عمومی (نباید signature تغییر کند)
+--------------------------------------------------------------------------------
+
+from liquidity_zone_engine import (
+    full_analysis,    # تحلیل کامل
+    build_zones,      # فقط زون‌ها
+    detect_swings,    # فقط سویینگ‌ها
+    detect_sweeps,    # فقط sweepها (نیاز به zones)
+    load_sample_data, # داده تست
+    test_engine,      # اعتبارسنجی آفلاین
+)
+
+# مثال:
+result = full_analysis(df, timeframe="H1")
+
+--------------------------------------------------------------------------------
+۴.۲ ورودی مورد انتظار
+--------------------------------------------------------------------------------
+
+DataFrame با ستون‌های OHLC (حساس به حروف نیست):
+  open, high, low, close
+timestamp: از index یا ستون timestamp
+
+--------------------------------------------------------------------------------
+۴.۳ خروجی full_analysis
+--------------------------------------------------------------------------------
+
+{
+  "zones": [...],
+  "swings": [...],
+  "sweeps": [...],
+  "timeframe": "H1"   # اختیاری
+}
+
+--------------------------------------------------------------------------------
+۴.۴ detect_swings — تشخic سویینگ
+--------------------------------------------------------------------------------
+
+الگوریتم:
+  1. پنجره متقارن (پیش‌فرض swing_window=3) برای swing high/low
+  2. فیلتر جابجایی: حداقل ATR × 0.8 نسبت به سویینگ مخالف قبلی
+  3. ادغام میکرو-سویینگ در consolidation (ATR × 0.8)
+  4. طبقه‌بندی leg: impulsive یا corrective
+     • impulsive: جابجایی ≥ ATR × 1.2
+     • corrective: کمتر از آن
+
+خروجی هر سویینگ:
+{
+  "type": "swing_high" | "swing_low",
+  "index": int,
+  "timestamp": datetime,
+  "price": float,
+  "leg_type": "impulsive" | "corrective"
+}
+
+--------------------------------------------------------------------------------
+۴.۵ build_zones — ساخت زون نقدینگی
+--------------------------------------------------------------------------------
+
+فرمول زون:
+  zone_low  = swing_price - (ATR × zone_k)
+  zone_high = swing_price + (ATR × zone_k)
+  zone_k پیش‌فرض = 0.6 (محدوده مجاز 0.4 تا 0.8)
+
+فشرده‌سازی زون (Zone Compression):
+  • ادغام فقط اگر leg_type یکسان باشد
+  • بدون Break of Structure (BOS) بین دو زون
+  • فاصله مراکز ≤ ATR × 1.4
+  • یا همپوشانی > 50% → ادغام اجباری
+
+تقسیم زون‌های بزرگ:
+  • اگر ارتفاع زون > ATR × 3 → split با سویینگ‌های داخلی
+
+فیلتر کیفیت:
+  • حذف: strength < 15 و touch_count < 2
+  • نگه‌داشتن فقط اگر: touch ≥ 2 OR displacement OR sweep reaction
+  • حذف sub-zoneهای تو در تو
+  • حذف همپوشانی redundant
+
+خروجی هر زون:
+{
+  "low": float,
+  "high": float,
+  "center": float,
+  "strength": int,           # 0–100 (نرمال‌شده، محدود 15–95)
+  "type": "impulsive" | "corrective",
+  "touch_count": int,
+  "sweep_count": int,
+  "role": "sub-zone"         # اختیاری — معمولاً فیلتر می‌شود
+}
+
+مدل strength (امتیازدهی):
+  strength_raw =
+    (rejections × 3) +
+    (sweeps × 4) +
+    (displacement_moves × 5) +
+    (time_decay × 1)
+
+--------------------------------------------------------------------------------
+۴.۶ detect_sweeps — تشخic جاروب نقدینگی
+--------------------------------------------------------------------------------
+
+تعریف sweep معتبر (هر سه شرط الزامی):
+
+  1. Wick از مرز زون عبور کند
+  2. Close داخل زون برگردد OR کندل rejection
+  3. Displacement اجباری در کندل بعد (impulse دور از زون)
+
+انواع:
+  • buy_side_sweep: wick بالای zone_high، close برمی‌گردد → نقدینگی خرید جاروب شد
+  • sell_side_sweep: wick زیر zone_low، close برمی‌گردد → نقدینگی فروش جاروب شد
+
+خروجی:
+{
+  "type": "buy_side_sweep" | "sell_side_sweep",
+  "zone_index": int,
+  "timestamp": datetime,
+  "price": float
+}
+
+--------------------------------------------------------------------------------
+۴.۷ پارامترهای config (EngineConfig)
+--------------------------------------------------------------------------------
+
+swing_window = 3
+atr_period = 14
+zone_k = 0.6
+cluster_atr_mult = 0.3
+min_swing_displacement_atr = 0.8
+consolidation_atr = 0.8
+impulse_displacement_atr = 1.2
+sweep_displacement_atr = 0.35
+max_zone_height_atr = 3.0
+zone_merge_atr = 1.4
+zone_overlap_merge_pct = 0.5
+min_zone_strength = 15
+
+================================================================================
+۵. ماژول lit_entry_trigger_engine — لایه سیگنال ورود
+================================================================================
+
+هدف: تبدیل خروجی تحلیل به setup معاملاتی — execution logic فقط.
+ورودی: فقط dict خروجی full_analysis (بدون fetch داده جدید).
+
+--------------------------------------------------------------------------------
+۵.۱ API
+--------------------------------------------------------------------------------
+
+from lit_entry_trigger_engine import detect_entries, test_entry_engine
+
+analysis = full_analysis(df)
+signals = detect_entries(analysis)
+# signals = {"entries": [...]}
+
+--------------------------------------------------------------------------------
+۵.۲ منطق ورود (Entry Logic)
+--------------------------------------------------------------------------------
+
+تریگر اصلی: رویداد Sweep معتبر
+
+  sell_side_sweep (جاروب زیر حمایت)  →  سیگنال BUY
+  buy_side_sweep (جاروب بالای مقاومت) →  سیگنال SELL
+
+فیلتر زون:
+  • zone strength ≥ 60
+  • touch_count ≥ 2 (زون قبلاً تست شده)
+
+Displacement اجباری:
+  • impulse بعد از sweep ≥ ATR × 1.2
+  • ATR از هندسه زون تخمین زده می‌شود: height / (2 × 0.6)
+
+فیلتر ساختار کوتاه‌مدت (از swings):
+  • bullish: higher highs + higher lows
+  • bearish: lower highs + lower lows
+  • neutral: غیره
+  • BUY در روند نزولی → confidence کاهش
+  • SELL در روند صعودی → confidence کاهش
+
+امتیاز confidence (0–100):
+  confidence =
+    sweep_quality × 30 +
+    displacement_strength × 30 +
+    zone_strength × 20 +
+    structure_alignment × 20
+  (حداکثر 100)
+
+قیمت ورود:
+  • BUY: retest لبه zone_low (نه روی کندل breakout)
+  • SELL: retest لبه zone_high
+
+Stop Loss:
+  • BUY: زیر sweep extreme − ATR × 0.2
+  • SELL: بالای sweep extreme + ATR × 0.2
+
+Take Profit:
+  • زون نقدینگی مقابل بعدی
+  • یا حداقل 2R (Risk/Reward ≥ 2)
+
+--------------------------------------------------------------------------------
+۵.۳ خروجی هر entry
+--------------------------------------------------------------------------------
+
+{
+  "type": "buy" | "sell",
+  "entry_price": float,
+  "stop_loss": float,
+  "take_profit": float,
+  "confidence": int,        # 0–100
+  "reason": str,            # توضیح انگلیسی
+  "related_zone": int,      # index زون مرتبط
+  "time": datetime
+}
+
+--------------------------------------------------------------------------------
+۵.۴ توابع داخلی
+--------------------------------------------------------------------------------
+
+filter_valid_sweeps(analysis)     — فیلتر sweep روی زون قوی
+calculate_displacement(...)       — تأیید impulse
+compute_confidence(...)           — امتیازدهی
+build_trade_plan(...)             — entry/SL/TP
+detect_entries(analysis)          — نقطه ورود اصلی
+test_entry_engine()               — تست با sample data
+
+================================================================================
+۶. لایه Django — داشبورد فارسی
+================================================================================
+
+URL: /dashboard/liquidity/
+Query params: ?symbol=EURUSD&timeframe=H1
+
+جریان view (liquidity_dashboard):
+  1. symbol و timeframe از GET
+  2. df = get_ohlc_data(symbol, timeframe)
+  3. result = full_analysis(df, timeframe=timeframe)
+  4. _prepare_display(result) → برچسب‌های فارسی (بدون محاسبه مجدد)
+  5. render → dashboard.html
+
+بخش‌های UI (فارسی RTL):
+  • تنظیمات: انتخاب نماد و تایم‌فریم + دکمه تحلیل
+  • کارت خلاصه: تعداد زون‌ها، سویینگ‌ها، sweepها
+  • جدول زون‌ها: حد پایین، حد بالا، مرکز، قدرت
+  • نمودار میله‌ای strength
+  • جدول sweepها
+  • جدول سویینگ‌ها
+
+قوانین UI:
+  • dir="rtl" — کاملاً فارسی
+  • کلیدهای داده انگلیسی (API-agnostic)
+  • هیچ re-calculation در template
+
+اجرای سرور:
+  cd LIT-UI
+  pip install -r requirements.txt
+  python manage.py runserver
+  → http://127.0.0.1:8000/dashboard/liquidity/
+
+================================================================================
+۷. اتصال MT5 (data_access.py)
+================================================================================
+
+تابع: get_ohlc_data(symbol: str, timeframe: str, bars=500)
+
+  • mt5.initialize() → copy_rates_from_pos → mt5.shutdown()
+  • read-only — login/auth تغییر نمی‌کند
+  • MT5 Terminal باید باز باشد
+
+نگاشت timeframe:
+  M5  → mt5.TIMEFRAME_M5
+  M15 → mt5.TIMEFRAME_M15
+  H1  → mt5.TIMEFRAME_H1
+  H4  → mt5.TIMEFRAME_H4
+  D1  → mt5.TIMEFRAME_D1
+
+================================================================================
+۸. مثال‌های کد کامل
+================================================================================
+
+--- تحلیل آفلاین (بدون MT5) ---
+from liquidity_zone_engine import full_analysis, load_sample_data
+df = load_sample_data()
+result = full_analysis(df, timeframe="M15")
+print(len(result["zones"]), len(result["sweeps"]))
+
+--- تحلیل زنده با MT5 + Django ---
+# از طریق UI یا:
+from dashboard.data_access import get_ohlc_data
+from liquidity_zone_engine import full_analysis
+df = get_ohlc_data("XAUUSD", "H1")
+result = full_analysis(df, timeframe="H1")
+
+--- سیگنال ورود ---
+from lit_entry_trigger_engine import detect_entries
+entries = detect_entries(result)
+for e in entries["entries"]:
+    print(e["type"], e["confidence"], e["entry_price"])
+
+--- تست ---
+from liquidity_zone_engine import test_engine
+from lit_entry_trigger_engine import test_entry_engine
+test_engine()        # اعتبارسنجی موتور تحلیل
+test_entry_engine()  # اعتبارسنجی موتور سیگنال
+
+================================================================================
+۹. مفاهیم کلیدی بازار (Concept Glossary)
+================================================================================
+
+Liquidity Zone (زون نقدینگی):
+  محدوده قیمتی که stop loss سفارشات خرد در آنجا جمع شده.
+  معمولاً دور swing high/low ساخته می‌شود.
+
+Liquidity Sweep (جاروب نقدینگی):
+  وقتی قیمت لحظاً از زون عبور می‌کند (wick) و برمی‌گردد.
+  هدف: فعال‌سازی stopها و جمع‌آوری نقدینگی قبل از حرکت اصلی.
+
+Swing High / Low:
+  قله و دره محلی در نمودار — پایه ساختار بازار.
+
+Break of Structure (BOS):
+  شکست سقف/کف ساختاری قبلی — مانع ادغام زون‌ها می‌شود.
+
+Impulsive Leg:
+  حرکت قوی در جهت روند (جابجایی بزرگ نسبت به ATR).
+
+Corrective Leg:
+  اصلاح / پولبک کوچک‌تر در خلاف جهت حرکت اصلی.
+
+ATR (Average True Range):
+  معیار نوسان — برای عرض زون، فیلتر sweep و SL/TP استفاده می‌شود.
+
+Displacement:
+  حرکت impulse بعد از sweep — تأییدکننده معتبر بودن جاروب.
+
+================================================================================
+۱۰. محدودیت‌ها و آنچه سیستم انجام نمی‌دهد
+================================================================================
+
+  ✗ اجرای سفارش در بروکر
+  ✗ مدیریت پوزیشن زنده
+  ✗ مدل ML / پیش‌بینی probabilistic
+  ✗ اندیکاتورهای خارج از OHLC (RSI, MACD, ...)
+  ✗ fetch خودکار داده در موتور تحلیل (caller باید df بدهد)
+  ✗ تضمین سود — فقط detection و signal layer
+
+================================================================================
+۱۱. وابستگی‌ها (requirements.txt)
+================================================================================
+
+pandas >= 2.0
+numpy >= 1.24
+Django >= 5.0
+MetaTrader5 >= 5.0.45
+
+================================================================================
+۱۲. نتایج نمونه روی داده تست (sample_data — 120 کندل M15)
+================================================================================
+
+full_analysis:
+  swings:  ~19 (از 22 خام — فیلتر نویز)
+  zones:   ~8  (فشرده‌سازی ~58%)
+  sweeps:  ~5  (با فیلتر displacement سخت‌گیرانه)
+
+detect_entries:
+  entries: ~3 setup (confidence 65–78)
+  فیلتر: فقط sweep روی zone strength ≥ 60
+
+================================================================================
+۱۳. معماری لایه‌ای — خلاصه برای تحلیل NotebookLM
+================================================================================
+
+┌─────────────────────────────────────────────────────────┐
+│  LAYER 4: Django Dashboard (فارسی RTL)                  │
+│  نمایش zones / swings / sweeps — بدون logic بازار       │
+└────────────────────────┬────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────┐
+│  LAYER 3: lit_entry_trigger_engine                      │
+│  analysis → entries (buy/sell, SL, TP, confidence)      │
+└────────────────────────┬────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────┐
+│  LAYER 2: liquidity_zone_engine                         │
+│  OHLC → zones + swings + sweeps                         │
+└────────────────────────┬────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────┐
+│  LAYER 1: MT5 data_access (get_ohlc_data)               │
+│  read-only OHLC از MetaTrader 5                         │
+└─────────────────────────────────────────────────────────┘
+
+اصل طراحی: Separation of Concerns
+  • L1: داده
+  • L2: تحلیل (pure pandas)
+  • L3: سیگنال (روی خروجی L2)
+  • L4: نمایش (Django)
+
+================================================================================
+۱۴. سوالات پیشنهادی برای NotebookLM
+================================================================================
+
+  1. نقاط ضعف منطق sweep در بازار رنج چیست؟
+  2. آیا threshold strength ≥ 60 برای XAUUSD مناسب است؟
+  3. چگونه می‌توان multi-timeframe را بدون تغییر API اضافه کرد؟
+  4. ریسک overfitting روی sample_data چقدر است؟
+  5. بهترین روش backtest برای lit_entry_trigger_engine چیست؟
+  6. مقایسه این رویکرد با ICT/SMC کلاسیک چگونه است؟
+
+================================================================================
+                              پایان مستند
+================================================================================
