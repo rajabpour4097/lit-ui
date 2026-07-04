@@ -282,3 +282,185 @@ def detect_sweeps(
 
     events.sort(key=lambda event: (event["timestamp"], event["zone_index"]))
     return events
+
+
+def _reclaim_within_bars(
+    index: int,
+    sweep_type: str,
+    level: float,
+    closes,
+    min_bars: int,
+    max_bars: int,
+) -> bool:
+    end = min(len(closes), index + max_bars + 1)
+    for j in range(index + min_bars, end):
+        if sweep_type == "buy_side_sweep" and closes[j] < level:
+            return True
+        if sweep_type == "sell_side_sweep" and closes[j] > level:
+            return True
+    if min_bars == 0:
+        if sweep_type == "buy_side_sweep" and closes[index] < level:
+            return True
+        if sweep_type == "sell_side_sweep" and closes[index] > level:
+            return True
+    return False
+
+
+def _reversal_after_sweep(
+    index: int,
+    sweep_type: str,
+    close: float,
+    closes,
+) -> bool:
+    if index + 1 >= len(closes):
+        return False
+    next_close = closes[index + 1]
+    if sweep_type == "buy_side_sweep":
+        return next_close < close
+    return next_close > close
+
+
+def _rejection_body_atr(
+    index: int,
+    sweep_type: str,
+    open_price: float,
+    high: float,
+    low: float,
+    close: float,
+    atr_value: float,
+) -> bool:
+    """Rejection candle body/range must be >= 0.5 ATR."""
+    threshold = atr_value * DEFAULT_CONFIG.smc_sweep_rejection_atr
+    if sweep_type == "buy_side_sweep":
+        rejection = high - close
+    else:
+        rejection = close - low
+    candle_range = high - low
+    return rejection >= threshold or candle_range >= threshold
+
+
+def _follow_through_after_sweep(
+    index: int,
+    sweep_type: str,
+    level: float,
+    closes,
+    atr_value: float,
+) -> bool:
+    """Next 1-2 bars must continue away from swept level."""
+    if index + 1 >= len(closes):
+        return False
+    move = abs(closes[index + 1] - closes[index])
+    if sweep_type == "buy_side_sweep":
+        return closes[index + 1] < level and move >= atr_value * 0.15
+    return closes[index + 1] > level and move >= atr_value * 0.15
+
+
+def detect_smc_sweeps(
+    df: pd.DataFrame,
+    swings: list[dict[str, Any]],
+    zones: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Institutional sweep: break swing level, reclaim within 3 bars,
+    rejection >= 0.5 ATR, with follow-through.
+    """
+    config = DEFAULT_CONFIG
+    data = normalize_ohlc(df)
+    opens = data["open"].to_numpy()
+    highs = data["high"].to_numpy()
+    lows = data["low"].to_numpy()
+    closes = data["close"].to_numpy()
+    atr = compute_atr(data, period=config.atr_period)
+
+    swing_highs = [s for s in swings if s["type"] == "swing_high"]
+    swing_lows = [s for s in swings if s["type"] == "swing_low"]
+    events: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+
+    for i in range(1, len(data)):
+        atr_value = float(atr.iloc[i])
+
+        for sh in swing_highs:
+            level = float(sh["price"])
+            if int(sh["index"]) >= i or highs[i] <= level:
+                continue
+            if not _reclaim_within_bars(i, "buy_side_sweep", level, closes, 0, config.sweep_reclaim_bars):
+                continue
+            if not _rejection_body_atr(i, "buy_side_sweep", opens[i], highs[i], lows[i], closes[i], atr_value):
+                continue
+            if not _follow_through_after_sweep(i, "buy_side_sweep", level, closes, atr_value):
+                continue
+
+            key = (i, "buy_side_sweep")
+            if key in seen:
+                continue
+            seen.add(key)
+
+            score = config.smc_sweep_base_score
+            if _reversal_after_sweep(i, "buy_side_sweep", closes[i], closes):
+                score += config.smc_sweep_reversal_score
+
+            zone_index = None
+            if zones:
+                zone_index = min(range(len(zones)), key=lambda z: abs(zones[z]["center"] - level))
+                if abs(zones[zone_index]["center"] - level) / max(level, 1e-9) <= 0.002:
+                    score += config.smc_sweep_zone_score
+
+            events.append(
+                {
+                    "type": "buy_side_sweep",
+                    "bar_index": i,
+                    "timestamp": resolve_timestamp(data, i),
+                    "price": round(float(closes[i]), 5),
+                    "liquidity_price": round(level, 5),
+                    "score": score,
+                    "confirmed": True,
+                    "real_sweep": True,
+                    "zone_index": zone_index,
+                    "classification": "buy_side_liquidity_grab",
+                }
+            )
+
+        for sl in swing_lows:
+            level = float(sl["price"])
+            if int(sl["index"]) >= i or lows[i] >= level:
+                continue
+            if not _reclaim_within_bars(i, "sell_side_sweep", level, closes, 0, config.sweep_reclaim_bars):
+                continue
+            if not _rejection_body_atr(i, "sell_side_sweep", opens[i], highs[i], lows[i], closes[i], atr_value):
+                continue
+            if not _follow_through_after_sweep(i, "sell_side_sweep", level, closes, atr_value):
+                continue
+
+            key = (i, "sell_side_sweep")
+            if key in seen:
+                continue
+            seen.add(key)
+
+            score = config.smc_sweep_base_score
+            if _reversal_after_sweep(i, "sell_side_sweep", closes[i], closes):
+                score += config.smc_sweep_reversal_score
+
+            zone_index = None
+            if zones:
+                zone_index = min(range(len(zones)), key=lambda z: abs(zones[z]["center"] - level))
+                if abs(zones[zone_index]["center"] - level) / max(level, 1e-9) <= 0.002:
+                    score += config.smc_sweep_zone_score
+
+            events.append(
+                {
+                    "type": "sell_side_sweep",
+                    "bar_index": i,
+                    "timestamp": resolve_timestamp(data, i),
+                    "price": round(float(closes[i]), 5),
+                    "liquidity_price": round(level, 5),
+                    "score": score,
+                    "confirmed": True,
+                    "real_sweep": True,
+                    "zone_index": zone_index,
+                    "classification": "sell_side_liquidity_grab",
+                }
+            )
+
+    events.sort(key=lambda e: (e["timestamp"], e["bar_index"]))
+    return events

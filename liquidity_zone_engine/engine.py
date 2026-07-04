@@ -12,16 +12,15 @@ from liquidity_zone_engine.bos_choch import detect_bos_choch_timeline
 from liquidity_zone_engine.broker_time import validate_broker_timezone
 from liquidity_zone_engine.config import DEFAULT_CONFIG, SUPPORTED_TIMEFRAMES
 from liquidity_zone_engine.fvg import detect_fvgs, find_fvg_retest_after_sweep
-from liquidity_zone_engine.lit_calibrate import calibrate_lit_output
+from liquidity_zone_engine.smc_dashboard import build_smc_zones, calibrate_smc_output, format_smc_zones
 from liquidity_zone_engine.sessions import analyze_session_liquidity
 from liquidity_zone_engine.structure import annotate_liquidity_roles, detect_swings
-from liquidity_zone_engine.sweeps import detect_sweeps
+from liquidity_zone_engine.sweeps import detect_smc_sweeps
 from liquidity_zone_engine.utils import normalize_ohlc
 from liquidity_zone_engine.zones import (
     build_fractal_zone_map,
     finalize_zones,
     flatten_zone_map,
-    regroup_zones,
 )
 
 
@@ -61,10 +60,9 @@ def full_analysis(
     timeframe: str | None = None,
 ) -> dict[str, Any]:
     """
-    Run LIT liquidity intelligence analysis with calibrated dashboard output.
+    Run SMC institutional trading analysis on OHLC data.
 
-    Returns regime/bias, max 5 H1 zones, filtered sweeps, BOS/CHOCH, targets,
-    and 2 trade scenarios.
+    Controlled output: max 20 swings, 12 zones, 10 sweeps, last 5 BOS, 2 scenarios.
     """
     if timeframe is not None and timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError(
@@ -81,36 +79,33 @@ def full_analysis(
     session = analyze_session_liquidity(data)
     daily_bias = compute_daily_bias(data, fvgs=fvgs)
 
-    grouped_raw = build_fractal_zone_map(data, swings, atr)
-    flat_raw = flatten_zone_map(grouped_raw)
-    prelim = finalize_zones(data, flat_raw, sweeps=[], atr=atr)
+    bos_timeline = detect_bos_choch_timeline(data, swings)
 
-    sweeps = detect_sweeps(df, prelim)
+    # Preliminary zones for sweep linking (rebuilt in calibrate)
+    prelim_grouped = build_smc_zones(data, swings, bos_timeline, sweeps=[])
+    prelim_flat = format_smc_zones(prelim_grouped)
+
+    sweeps = detect_smc_sweeps(df, swings, prelim_flat)
     sweeps = _enrich_sweeps_with_fvg(data, sweeps, fvgs)
 
-    bos_timeline = detect_bos_choch_timeline(data, swings)
-    lit = calibrate_lit_output(
-        data,
-        swings,
-        regroup_zones(finalize_zones(data, prelim, sweeps, atr)),
-        sweeps,
-        bos_timeline,
-        timeframe=timeframe,
-    )
+    smc = calibrate_smc_output(data, swings, sweeps, bos_timeline)
 
-    flat_zones = lit["zones"]
-    swings = annotate_liquidity_roles(swings, lit["sweeps"], flat_zones)
+    flat_zones = smc["zones"]
+    swings = annotate_liquidity_roles(swings, smc["sweeps"], flat_zones)
+
+    grouped_raw = build_fractal_zone_map(data, swings, atr)
+    flat_raw = flatten_zone_map(grouped_raw)
 
     result: dict[str, Any] = {
-        "market_summary": lit["market_summary"],
-        "liquidity_targets": lit["liquidity_targets"],
-        "liquidity_pools": lit["liquidity_pools"],
-        "zones": lit["zones_grouped"],
-        "zones_flat": lit["zones"],
-        "sweeps": lit["sweeps"],
+        "market_summary": smc["market_summary"],
+        "liquidity_targets": smc["liquidity_targets"],
+        "liquidity_pools": smc["liquidity_pools"],
+        "zones": smc["zones_grouped"],
+        "zones_flat": smc["zones"],
+        "sweeps": smc["sweeps"],
         "swings": swings,
-        "bos_choch": lit["bos_choch"],
-        "trade_scenarios": lit["trade_scenarios"],
+        "bos_choch": smc["bos_choch"],
+        "trade_scenarios": smc["trade_scenarios"],
         "fvgs": [
             {
                 "type": fvg["type"],
@@ -127,7 +122,7 @@ def full_analysis(
         "daily_bias": daily_bias,
         "validation": {
             "zones_before": len(flat_raw),
-            **lit["validation"],
+            **smc["validation"],
         },
     }
 

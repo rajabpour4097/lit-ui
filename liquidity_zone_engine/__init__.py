@@ -1,8 +1,8 @@
 """
-Liquidity Intelligence Engine (LIT).
+Liquidity Intelligence Engine (LIT / SMC).
 
 Pure pandas-based market structure analysis:
-swing detection, ATR liquidity zones, clustering, and sweep events.
+swing detection, liquidity zones, clustering, and sweep events.
 """
 
 from liquidity_zone_engine.engine import full_analysis
@@ -11,6 +11,7 @@ from liquidity_zone_engine.structure import _find_raw_swings, detect_swings
 from liquidity_zone_engine.sweeps import detect_sweeps
 from liquidity_zone_engine.zones import build_zones, flatten_zone_map
 from liquidity_zone_engine.utils import normalize_ohlc
+from liquidity_zone_engine.config import DEFAULT_CONFIG
 
 __all__ = [
     "build_zones",
@@ -23,38 +24,30 @@ __all__ = [
 
 
 def test_engine():
-    """Validate LIT-calibrated output (hard rules)."""
+    """Validate SMC institutional output (controlled detection)."""
     df = load_sample_data()
-    data = normalize_ohlc(df)
-
-    highs = data["high"].to_numpy()
-    lows = data["low"].to_numpy()
-    raw_swings = _find_raw_swings(data, highs, lows, swing_window=3)
-
     result = full_analysis(df, timeframe="H1")
     zones = result.get("zones_flat") or flatten_zone_map(result["zones"])
     sweeps = result["sweeps"]
     summary = result["market_summary"]
+    swings = result["swings"]
 
-    assert len(result["swings"]) < len(raw_swings), "swing noise filter should reduce swing count"
-    assert len(zones) <= 5, "H1 LIT output must have max 5 zones"
+    assert len(swings) <= DEFAULT_CONFIG.smc_max_swings
+    assert len(swings) >= 1
+    assert len(zones) <= DEFAULT_CONFIG.smc_max_zones_total
     assert summary["regime"] in ("trending_bull", "trending_bear", "range")
-    if summary["regime"] == "range":
-        assert summary["bias"] == "neutral"
-
-    strengths = [z["strength"] for z in zones]
-    if strengths:
-        above_80 = sum(1 for s in strengths if s > 80)
-        assert above_80 <= max(1, int(len(strengths) * 0.15) + 1)
+    assert len(result["bos_choch"]) <= DEFAULT_CONFIG.smc_bos_window
+    assert len(result["trade_scenarios"]) == 2
+    assert "liquidity_targets" in result
 
     for sweep in sweeps:
-        assert sweep.get("real_sweep") is True
-        assert sweep.get("has_displacement")
+        assert sweep.get("confirmed") is True
+        assert sweep.get("score", 0) >= 60
 
-    assert len(result["trade_scenarios"]) <= 2
-    assert "liquidity_targets" in result
-    assert result["liquidity_targets"]["buy_side_liquidity"] is None or isinstance(
-        result["liquidity_targets"]["buy_side_liquidity"], (int, float)
-    )
+    for scenario in result["trade_scenarios"]:
+        assert "reasoning" in scenario
+        if scenario.get("active"):
+            assert scenario.get("stop_loss") is not None
+            assert scenario.get("take_profit") is not None
 
     return result

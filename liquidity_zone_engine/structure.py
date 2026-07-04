@@ -358,12 +358,12 @@ def _filter_lit_structure_swings(
 
 def detect_swings(df: pd.DataFrame, swing_window: int = 3) -> list[dict[str, Any]]:
     """
-    Detect swing highs and swing lows using a symmetric lookback/lookahead window.
-
-    Applies ATR displacement filtering, BOS/IDM annotation, and consolidation merge.
+    Controlled swing extraction: fractal ±3, significant distance filter, max 20.
     """
     if swing_window < 1:
         raise ValueError("swing_window must be >= 1")
+
+    from liquidity_zone_engine.smc_dashboard import filter_controlled_swings
 
     config = DEFAULT_CONFIG
     data = normalize_ohlc(df)
@@ -372,43 +372,7 @@ def detect_swings(df: pd.DataFrame, swing_window: int = 3) -> list[dict[str, Any
     lows = data["low"].to_numpy()
 
     raw = _find_raw_swings(data, highs, lows, swing_window)
-    filtered = _filter_by_displacement(
-        raw,
-        atr,
-        min_mult=config.min_swing_displacement_atr,
-    )
-    consolidated = _merge_consolidation_swings(
-        filtered,
-        atr,
-        consolidation_mult=config.consolidation_atr,
-    )
-    structural = _filter_lit_structure_swings(consolidated, data, atr)
-    classified = _classify_swing_legs(
-        structural,
-        atr,
-        impulse_mult=config.impulse_displacement_atr,
-    )
-
-    bos_events = _detect_bos_events(data, classified, atr)
-    annotated = _annotate_idm_and_structure(classified, bos_events)
-
-    deduped: list[dict[str, Any]] = []
-    for swing in annotated:
-        if not deduped:
-            deduped.append(swing)
-            continue
-
-        prev = deduped[-1]
-        if swing["type"] == prev["type"]:
-            atr_value = float(atr.iloc[swing["index"]])
-            if abs(swing["price"] - prev["price"]) <= atr_value * config.consolidation_atr:
-                if swing["type"] == "swing_high" and swing["price"] > prev["price"]:
-                    deduped[-1] = swing
-                elif swing["type"] == "swing_low" and swing["price"] < prev["price"]:
-                    deduped[-1] = swing
-                continue
-
-        deduped.append(swing)
+    filtered = filter_controlled_swings(raw, data, atr)
 
     return [
         {
@@ -416,11 +380,11 @@ def detect_swings(df: pd.DataFrame, swing_window: int = 3) -> list[dict[str, Any
             "index": swing["index"],
             "timestamp": swing["timestamp"],
             "price": swing["price"],
-            "leg_type": swing["leg_type"],
-            "is_idm": bool(swing.get("is_idm", False)),
-            "structure_role": swing.get("structure_role", "structural"),
-            "bos_type": swing.get("bos_type"),
-            "liquidity_status": swing.get("liquidity_status", "targeted"),
+            "leg_type": "impulse",
+            "is_idm": False,
+            "structure_role": "structural",
+            "bos_type": None,
+            "liquidity_status": "targeted",
         }
-        for swing in deduped
+        for swing in filtered
     ]
