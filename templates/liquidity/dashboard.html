@@ -17,7 +17,7 @@
             <div class="d-flex align-items-center justify-content-between py-3">
                 <div>
                     <h1 class="lit-title mb-1">داشبورد تحلیل نقدینگی</h1>
-                    <p class="lit-subtitle mb-0">تحلیل هوش نقدینگی — ساختار بازار، زون‌ها و جاروب‌ها</p>
+                    <p class="lit-subtitle mb-0">SMC — زون‌های institutional، sweep معتبر، ساختار بازار</p>
                 </div>
                 <div class="lit-badge">
                     <span>{{ symbol }}</span>
@@ -29,7 +29,6 @@
     </header>
 
     <main class="container-fluid px-4 pb-5">
-        <!-- Section 1: Controls -->
         <section class="lit-section">
             <div class="lit-card">
                 <h2 class="lit-section-title">تنظیمات تحلیل</h2>
@@ -58,41 +57,110 @@
         </section>
 
         {% if error_message %}
-            <div class="alert lit-alert" role="alert">
-                {{ error_message }}
-            </div>
+            <div class="alert lit-alert" role="alert">{{ error_message }}</div>
         {% endif %}
 
         {% if display %}
-            <!-- Section 2: Summary Cards -->
+            <!-- Summary -->
             <section class="lit-section">
                 <div class="row g-3">
-                    <div class="col-md-4">
+                    <div class="col-md-3">
                         <div class="lit-stat-card">
-                            <span class="lit-stat-label">تعداد زون‌های نقدینگی</span>
+                            <span class="lit-stat-label">زون‌های معتبر</span>
                             <span class="lit-stat-value">{{ display.zone_count }}</span>
+                            <span class="lit-stat-meta">{{ display.zones_before }} ← {{ display.zones_after }}</span>
                         </div>
                     </div>
-                    <div class="col-md-4">
+                    <div class="col-md-3">
                         <div class="lit-stat-card">
-                            <span class="lit-stat-label">تعداد سویینگ‌ها</span>
-                            <span class="lit-stat-value">{{ display.swing_count }}</span>
-                        </div>
-                    </div>
-                    <div class="col-md-4">
-                        <div class="lit-stat-card">
-                            <span class="lit-stat-label">تعداد Sweep ها</span>
+                            <span class="lit-stat-label">Sweep معتبر</span>
                             <span class="lit-stat-value">{{ display.sweep_count }}</span>
+                            <span class="lit-stat-meta">{{ display.sweeps_before }} ← {{ display.sweeps_after }}</span>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="lit-stat-card">
+                            <span class="lit-stat-label">روند H1</span>
+                            <span class="lit-stat-value lit-trend">{{ display.market_structure.trend_fa }}</span>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="lit-stat-card">
+                            <span class="lit-stat-label">سویینگ‌ها</span>
+                            <span class="lit-stat-value">{{ display.swing_count }}</span>
                         </div>
                     </div>
                 </div>
             </section>
 
-            <!-- Section 3: Liquidity Zones -->
+            <!-- Market Structure -->
             <section class="lit-section">
                 <div class="lit-card">
-                    <h2 class="lit-section-title">زون‌های نقدینگی</h2>
+                    <h2 class="lit-section-title">خلاصه ساختار بازار</h2>
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <div class="lit-info-box">
+                                <span class="lit-info-label">قیمت فعلی</span>
+                                <span class="lit-info-value">{{ display.market_structure.last_close }}</span>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="lit-info-box">
+                                <span class="lit-info-label">هدف نقدینگی بالا (Buy-side)</span>
+                                <span class="lit-info-value">{{ display.market_structure.buy_target_fmt }}</span>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="lit-info-box">
+                                <span class="lit-info-label">هدف نقدینگی پایین (Sell-side)</span>
+                                <span class="lit-info-value">{{ display.market_structure.sell_target_fmt }}</span>
+                            </div>
+                        </div>
+                    </div>
+                    {% if display.market_structure.key_bos_levels %}
+                        <h3 class="lit-subsection-title mt-3">BOS کلیدی</h3>
+                        <div class="table-responsive">
+                            <table class="table lit-table align-middle">
+                                <thead>
+                                    <tr>
+                                        <th>جهت</th>
+                                        <th>سطح</th>
+                                        <th>زمان</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for bos in display.market_structure.key_bos_levels %}
+                                        <tr>
+                                            <td>{{ bos.direction }}</td>
+                                            <td>{{ bos.level }}</td>
+                                            <td>{{ bos.timestamp }}</td>
+                                        </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    {% endif %}
+                </div>
+            </section>
 
+            <!-- Fix Summary -->
+            {% if display.fix_notes %}
+            <section class="lit-section">
+                <div class="lit-card lit-fix-card">
+                    <h2 class="lit-section-title">گزارش اصلاح و اعتبارسنجی</h2>
+                    <ul class="lit-fix-list mb-0">
+                        {% for note in display.fix_notes %}
+                            <li>{{ note }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            </section>
+            {% endif %}
+
+            <!-- Zones -->
+            <section class="lit-section">
+                <div class="lit-card">
+                    <h2 class="lit-section-title">زون‌های نقدینگی (پاکسازی‌شده)</h2>
                     {% if display.zones %}
                         <div class="table-responsive mb-4">
                             <table class="table lit-table align-middle">
@@ -100,8 +168,11 @@
                                     <tr>
                                         <th>حد پایین</th>
                                         <th>حد بالا</th>
-                                        <th>مرکز زون</th>
+                                        <th>مرکز</th>
                                         <th>قدرت</th>
+                                        <th>نوع</th>
+                                        <th>لایه</th>
+                                        <th>Touch</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -110,48 +181,48 @@
                                             <td>{{ zone.low_fmt }}</td>
                                             <td>{{ zone.high_fmt }}</td>
                                             <td>{{ zone.center_fmt }}</td>
-                                            <td>
-                                                <span class="lit-strength-badge">{{ zone.strength }}</span>
-                                            </td>
+                                            <td><span class="lit-strength-badge">{{ zone.strength }}</span></td>
+                                            <td>{{ zone.zone_type_fa }}</td>
+                                            <td>{{ zone.level_fa }}</td>
+                                            <td>{{ zone.touch_count|default:"—" }}</td>
                                         </tr>
                                     {% endfor %}
                                 </tbody>
                             </table>
                         </div>
-
-                        <h3 class="lit-subsection-title">نمایش گرافیکی قدرت زون‌ها</h3>
+                        <h3 class="lit-subsection-title">قدرت زون‌ها</h3>
                         <div class="lit-chart">
                             {% for zone in display.zones %}
                                 <div class="lit-chart-row">
                                     <span class="lit-chart-label">{{ zone.center_fmt }}</span>
                                     <div class="lit-chart-bar-wrap">
-                                        <div class="lit-chart-bar"
-                                             style="width: {% widthratio zone.strength display.max_strength 100 %}%;">
-                                        </div>
+                                        <div class="lit-chart-bar" style="width: {% widthratio zone.strength display.max_strength 100 %}%;"></div>
                                     </div>
                                     <span class="lit-chart-strength">{{ zone.strength }}</span>
                                 </div>
                             {% endfor %}
                         </div>
                     {% else %}
-                        <p class="lit-empty">زون نقدینگی یافت نشد.</p>
+                        <p class="lit-empty">زون institutional یافت نشد — فیلتر فعالیت/قدرت همه را حذف کرده.</p>
                     {% endif %}
                 </div>
             </section>
 
-            <!-- Section 4: Sweeps -->
+            <!-- Sweeps -->
             <section class="lit-section">
                 <div class="lit-card">
-                    <h2 class="lit-section-title">رویدادهای Sweep</h2>
+                    <h2 class="lit-section-title">Sweep های معتبر</h2>
                     {% if display.sweeps %}
                         <div class="table-responsive">
                             <table class="table lit-table align-middle">
                                 <thead>
                                     <tr>
                                         <th>نوع</th>
+                                        <th>طبقه‌بندی SMC</th>
                                         <th>قیمت</th>
+                                        <th>امتیاز</th>
+                                        <th>زون مرتبط</th>
                                         <th>زمان</th>
-                                        <th>شاخص زون</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -162,21 +233,73 @@
                                                     {{ sweep.type_fa }}
                                                 </span>
                                             </td>
+                                            <td>{{ sweep.classification_fa }}</td>
                                             <td>{{ sweep.price_fmt }}</td>
+                                            <td>{{ sweep.score }}</td>
+                                            <td>{{ sweep.linked_zone_fmt }}</td>
                                             <td>{{ sweep.timestamp_fmt }}</td>
-                                            <td>{{ sweep.zone_index }}</td>
                                         </tr>
                                     {% endfor %}
                                 </tbody>
                             </table>
                         </div>
                     {% else %}
-                        <p class="lit-empty">رویداد Sweep یافت نشد.</p>
+                        <p class="lit-empty">Sweep معتبر یافت نشد.</p>
                     {% endif %}
                 </div>
             </section>
 
-            <!-- Section 5: Swings -->
+            <!-- BOS / CHOCH -->
+            {% if display.bos_choch %}
+            <section class="lit-section">
+                <div class="lit-card">
+                    <h2 class="lit-section-title">BOS / CHOCH Timeline</h2>
+                    <div class="table-responsive">
+                        <table class="table lit-table align-middle">
+                            <thead>
+                                <tr>
+                                    <th>نوع</th>
+                                    <th>جهت</th>
+                                    <th>سطح</th>
+                                    <th>اعتبار</th>
+                                    <th>زمان</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for event in display.bos_choch %}
+                                    <tr>
+                                        <td>{{ event.type }}</td>
+                                        <td>{{ event.direction }}</td>
+                                        <td>{{ event.level }}</td>
+                                        <td>{{ event.validity }}</td>
+                                        <td>{{ event.timestamp }}</td>
+                                    </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+            {% endif %}
+
+            <!-- Trade Scenarios -->
+            {% if display.trade_scenarios %}
+            <section class="lit-section">
+                <div class="lit-card">
+                    <h2 class="lit-section-title">سناریوهای معاملاتی</h2>
+                    {% for scenario in display.trade_scenarios %}
+                        <div class="lit-info-box mb-2">
+                            <strong>{{ scenario.name }}</strong> — {{ scenario.setup_type }}<br>
+                            Entry: {{ scenario.entry_zone.low }} – {{ scenario.entry_zone.high }} |
+                            SL: {{ scenario.invalidation }} |
+                            Target: {{ scenario.target_liquidity|default:"—" }}
+                        </div>
+                    {% endfor %}
+                </div>
+            </section>
+            {% endif %}
+
+            <!-- Swings -->
             <section class="lit-section">
                 <div class="lit-card">
                     <h2 class="lit-section-title">سویینگ‌های بازار</h2>

@@ -18,6 +18,15 @@ SL_ATR_BUFFER = 0.2
 MIN_RR = 2.0
 
 
+def _zones_from_analysis(analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    zones = analysis.get("zones", [])
+    if isinstance(zones, dict):
+        from liquidity_zone_engine.zones import flatten_zone_map
+
+        return flatten_zone_map(zones)
+    return zones
+
+
 def _estimate_atr(zone: dict[str, Any]) -> float:
     height = float(zone["high"]) - float(zone["low"])
     if height <= 0:
@@ -55,12 +64,17 @@ def _structure_bias(swings: list[dict[str, Any]]) -> str:
 
 
 def filter_valid_sweeps(analysis: dict[str, Any]) -> list[dict[str, Any]]:
-    """Keep sweeps tied to strong, previously respected zones."""
-    zones = analysis.get("zones", [])
+    """Keep sweeps tied to strong zones with FVG POI and 3-candle confirmation."""
+    zones = _zones_from_analysis(analysis)
     sweeps = analysis.get("sweeps", [])
 
     valid: list[dict[str, Any]] = []
     for sweep in sweeps:
+        if sweep.get("significance") == "noise":
+            continue
+        if sweep.get("zone_level") == "micro":
+            continue
+
         zone_index = sweep.get("zone_index")
         if zone_index is None or zone_index >= len(zones):
             continue
@@ -72,6 +86,10 @@ def filter_valid_sweeps(analysis: dict[str, Any]) -> list[dict[str, Any]]:
         if strength < MIN_ZONE_STRENGTH:
             continue
         if touch_count < MIN_TOUCH_COUNT:
+            continue
+        if not sweep.get("three_candle_confirmed", False):
+            continue
+        if not sweep.get("fvg_poi_valid", False):
             continue
 
         valid.append({**sweep, "_zone": zone, "_zone_index": zone_index})
@@ -141,7 +159,9 @@ def _sweep_quality_score(sweep: dict[str, Any], zone: dict[str, Any]) -> float:
 
     penetration_ratio = min(1.0, penetration / (zone_height * 0.5))
     sweep_history = min(1.0, int(zone.get("sweep_count", 0)) / 3.0)
-    return min(1.0, 0.6 * penetration_ratio + 0.4 * sweep_history + 0.2)
+    fvg_bonus = 0.15 if sweep.get("fvg_poi_valid") else 0.0
+    candle_bonus = 0.15 if sweep.get("three_candle_confirmed") else 0.0
+    return min(1.0, 0.5 * penetration_ratio + 0.35 * sweep_history + fvg_bonus + candle_bonus)
 
 
 def _structure_alignment_score(setup_type: str, structure: str) -> float:
@@ -158,22 +178,52 @@ def _structure_alignment_score(setup_type: str, structure: str) -> float:
     return 0.7
 
 
+def _session_alignment_score(setup_type: str, session: dict[str, Any]) -> float:
+    reversal = session.get("reversal_bias")
+    if not session.get("asian_sweep_active") or reversal is None:
+        return 0.85
+    if setup_type == reversal:
+        return 1.0
+    return 0.45
+
+
+def _daily_bias_alignment_score(setup_type: str, daily_bias: dict[str, Any]) -> float:
+    bias = daily_bias.get("bias", "neutral")
+    if bias == "neutral":
+        return 0.85
+    if setup_type == "buy" and bias == "bullish":
+        return 1.0
+    if setup_type == "sell" and bias == "bearish":
+        return 1.0
+    if setup_type == "buy" and bias == "bearish":
+        return 0.4
+    if setup_type == "sell" and bias == "bullish":
+        return 0.4
+    return 0.7
+
+
 def compute_confidence(
     sweep: dict[str, Any],
     zone: dict[str, Any],
     displacement_strength: float,
     setup_type: str,
     structure: str,
+    session: dict[str, Any],
+    daily_bias: dict[str, Any],
 ) -> int:
     sweep_quality = _sweep_quality_score(sweep, zone)
     zone_strength = min(1.0, int(zone.get("strength", 0)) / 100.0)
     structure_score = _structure_alignment_score(setup_type, structure)
+    session_score = _session_alignment_score(setup_type, session)
+    bias_score = _daily_bias_alignment_score(setup_type, daily_bias)
 
     raw = (
-        sweep_quality * 30.0
-        + displacement_strength * 30.0
+        sweep_quality * 25.0
+        + displacement_strength * 25.0
         + zone_strength * 20.0
-        + structure_score * 20.0
+        + structure_score * 15.0
+        + session_score * 10.0
+        + bias_score * 5.0
     )
     return min(100, max(0, int(round(raw))))
 
@@ -211,15 +261,18 @@ def build_trade_plan(
     confidence: int,
     displacement_strength: float,
     structure: str,
+    session: dict[str, Any],
+    daily_bias: dict[str, Any],
 ) -> dict[str, Any]:
     atr = _estimate_atr(zone)
     zone_low = float(zone["low"])
     zone_high = float(zone["high"])
     sweep_price = float(sweep["price"])
     sweep_time = _parse_time(sweep["timestamp"])
+    fvg_poi = sweep.get("fvg_poi")
 
     if setup_type == "buy":
-        entry_price = zone_low
+        entry_price = float(fvg_poi["low"]) if fvg_poi else zone_low
         sweep_extreme = min(zone_low, sweep_price)
         stop_loss = sweep_extreme - atr * SL_ATR_BUFFER
         risk = entry_price - stop_loss
@@ -227,11 +280,12 @@ def build_trade_plan(
         tp_from_zone = opposing if opposing is not None else entry_price + risk * MIN_RR
         take_profit = max(tp_from_zone, entry_price + risk * MIN_RR)
         reason = (
-            "Sell-side liquidity sweep below support, bullish displacement, "
-            f"retest entry at zone low (structure: {structure})"
+            "Sell-side sweep + FVG POI retest + 3-candle confirmation; "
+            f"structure={structure}, session_reversal={session.get('reversal_bias')}, "
+            f"daily_bias={daily_bias.get('bias')}"
         )
     else:
-        entry_price = zone_high
+        entry_price = float(fvg_poi["high"]) if fvg_poi else zone_high
         sweep_extreme = max(zone_high, sweep_price)
         stop_loss = sweep_extreme + atr * SL_ATR_BUFFER
         risk = stop_loss - entry_price
@@ -239,8 +293,9 @@ def build_trade_plan(
         tp_from_zone = opposing if opposing is not None else entry_price - risk * MIN_RR
         take_profit = min(tp_from_zone, entry_price - risk * MIN_RR)
         reason = (
-            "Buy-side liquidity sweep above resistance, bearish displacement, "
-            f"retest entry at zone high (structure: {structure})"
+            "Buy-side sweep + FVG POI retest + 3-candle confirmation; "
+            f"structure={structure}, session_reversal={session.get('reversal_bias')}, "
+            f"daily_bias={daily_bias.get('bias')}"
         )
 
     if risk <= 0:
@@ -269,8 +324,10 @@ def detect_entries(analysis: dict[str, Any]) -> dict[str, Any]:
 
     Expects the dict returned by liquidity_zone_engine.full_analysis().
     """
-    zones = analysis.get("zones", [])
+    zones = _zones_from_analysis(analysis)
     swings = analysis.get("swings", [])
+    session = analysis.get("session", {})
+    daily_bias = analysis.get("daily_bias", {})
     structure = _structure_bias(swings)
 
     entries: list[dict[str, Any]] = []
@@ -287,6 +344,10 @@ def detect_entries(analysis: dict[str, Any]) -> dict[str, Any]:
         else:
             continue
 
+        if session.get("asian_sweep_active") and session.get("reversal_bias"):
+            if setup_type != session["reversal_bias"]:
+                continue
+
         dedupe_key = (zone_index, setup_type)
         if dedupe_key in seen:
             continue
@@ -298,9 +359,15 @@ def detect_entries(analysis: dict[str, Any]) -> dict[str, Any]:
             continue
 
         confidence = compute_confidence(
-            sweep, zone, displacement_strength, setup_type, structure
+            sweep,
+            zone,
+            displacement_strength,
+            setup_type,
+            structure,
+            session,
+            daily_bias,
         )
-        if confidence < 40:
+        if confidence < 45:
             continue
 
         plan = build_trade_plan(
@@ -312,6 +379,8 @@ def detect_entries(analysis: dict[str, Any]) -> dict[str, Any]:
             confidence=confidence,
             displacement_strength=displacement_strength,
             structure=structure,
+            session=session,
+            daily_bias=daily_bias,
         )
         plan.pop("_displacement_strength", None)
         entries.append(plan)

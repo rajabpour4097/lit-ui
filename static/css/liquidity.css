@@ -88,6 +88,47 @@ body.lit-body {
     color: var(--lit-accent-2);
 }
 
+.lit-stat-meta {
+    font-size: 0.75rem;
+    color: var(--lit-muted);
+}
+
+.lit-trend {
+    font-size: 1.35rem !important;
+}
+
+.lit-info-box {
+    background: var(--lit-surface-2);
+    border-radius: 10px;
+    padding: 0.85rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.lit-info-label {
+    font-size: 0.8rem;
+    color: var(--lit-muted);
+}
+
+.lit-info-value {
+    font-weight: 600;
+    font-size: 1.05rem;
+}
+
+.lit-fix-card {
+    border-color: rgba(56, 189, 248, 0.35);
+}
+
+.lit-fix-list {
+    padding-right: 1.25rem;
+    color: var(--lit-muted);
+}
+
+.lit-fix-list li {
+    margin-bottom: 0.35rem;
+}
+
 .lit-section-title {
     font-size: 1.1rem;
     font-weight: 700;

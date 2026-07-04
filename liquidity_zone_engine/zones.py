@@ -1,4 +1,4 @@
-"""ATR-based liquidity zone construction and clustering."""
+"""Fractal multi-layer liquidity zone construction."""
 
 from __future__ import annotations
 
@@ -7,99 +7,406 @@ from typing import Any
 import pandas as pd
 
 from liquidity_zone_engine.atr import compute_atr
-from liquidity_zone_engine.config import DEFAULT_CONFIG, EngineConfig
+from liquidity_zone_engine.config import DEFAULT_CONFIG, ZONE_LEVELS, EngineConfig
 from liquidity_zone_engine.structure import detect_swings, has_break_of_structure
+from liquidity_zone_engine.sweeps import detect_sweeps
 from liquidity_zone_engine.utils import normalize_ohlc
 
+LEVEL_ZONE_K = {"macro": 0.75, "mid": 0.6, "micro": 0.45}
 
-def _build_raw_zones(
+
+def flatten_zone_map(grouped: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Flatten grouped zones to a list preserving level metadata."""
+    flat: list[dict[str, Any]] = []
+    for level in ("macro", "mid", "micro"):
+        for layer_index, zone in enumerate(grouped.get(level, [])):
+            flat.append({**zone, "level": level, "layer_index": layer_index})
+    return flat
+
+
+def regroup_zones(flat: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Regroup flat zone list by level."""
+    grouped: dict[str, list[dict[str, Any]]] = {"macro": [], "mid": [], "micro": []}
+    for zone in flat:
+        level = zone.get("level", "mid")
+        if level not in grouped:
+            grouped[level] = []
+        cleaned = {k: v for k, v in zone.items() if not k.startswith("_")}
+        grouped[level].append(cleaned)
+    return grouped
+
+
+def _zone_from_point(
+    price: float,
+    index: int,
+    atr_value: float,
+    level: str,
+    leg_type: str,
+    swing_type: str,
+) -> dict[str, Any]:
+    half = atr_value * LEVEL_ZONE_K.get(level, DEFAULT_CONFIG.zone_k)
+    return {
+        "low": price - half,
+        "high": price + half,
+        "center": price,
+        "strength": 0,
+        "type": leg_type,
+        "level": level,
+        "level_rank": ZONE_LEVELS[level],
+        "touch_count": 0,
+        "sweep_count": 0,
+        "_atr": atr_value,
+        "_index": index,
+        "_leg_type": leg_type,
+        "_swing_type": swing_type,
+    }
+
+
+def _swing_displacement(
+    swing: dict[str, Any],
+    prev_opposite: dict[str, Any] | None,
+) -> float:
+    if prev_opposite is None:
+        return float("inf")
+    return abs(float(swing["price"]) - float(prev_opposite["price"]))
+
+
+def _is_idm_swing(swing: dict[str, Any]) -> bool:
+    return bool(swing.get("is_idm")) or swing.get("structure_role") == "idm"
+
+
+def _liquidity_point(
+    price: float,
+    index: int,
+    atr_value: float,
+    swing_type: str,
+    leg_type: str,
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "price": price,
+        "index": index,
+        "_atr": atr_value,
+        "_swing_type": swing_type,
+        "_leg_type": leg_type,
+        "_source": source,
+    }
+
+
+def _collect_swing_points(
     swings: list[dict[str, Any]],
     atr: pd.Series,
-    zone_k: float,
+    min_displacement_atr: float,
 ) -> list[dict[str, Any]]:
-    zones: list[dict[str, Any]] = []
+    points: list[dict[str, Any]] = []
+    last_high: dict[str, Any] | None = None
+    last_low: dict[str, Any] | None = None
 
     for swing in swings:
-        idx = swing["index"]
-        atr_value = float(atr.iloc[idx])
-        if atr_value <= 0:
+        if _is_idm_swing(swing):
             continue
 
-        swing_price = float(swing["price"])
-        half_width = atr_value * zone_k
-        leg_type = swing.get("leg_type", "corrective")
+        idx = int(swing["index"])
+        atr_value = float(atr.iloc[idx])
+        prev = last_low if swing["type"] == "swing_high" else last_high
+        displacement = _swing_displacement(swing, prev)
 
-        zones.append(
-            {
-                "low": swing_price - half_width,
-                "high": swing_price + half_width,
-                "center": swing_price,
-                "strength": 0,
-                "type": leg_type,
-                "touch_count": 0,
-                "sweep_count": 0,
-                "_atr": atr_value,
-                "_index": idx,
-                "_leg_type": leg_type,
-                "_swing_type": swing["type"],
-            }
+        if displacement < atr_value * min_displacement_atr:
+            if swing["type"] == "swing_high":
+                last_high = swing
+            else:
+                last_low = swing
+            continue
+
+        points.append(
+            _liquidity_point(
+                float(swing["price"]),
+                idx,
+                atr_value,
+                swing["type"],
+                swing.get("leg_type", "corrective"),
+                "swing",
+            )
         )
 
-    return zones
+        if swing["type"] == "swing_high":
+            last_high = swing
+        else:
+            last_low = swing
+
+    return points
 
 
-def _zone_overlap_ratio(left: dict[str, Any], right: dict[str, Any]) -> float:
-    overlap_low = max(left["low"], right["low"])
-    overlap_high = min(left["high"], right["high"])
-    if overlap_high <= overlap_low:
-        return 0.0
+def _collect_wick_points(data: pd.DataFrame, atr: pd.Series) -> list[dict[str, Any]]:
+    config = DEFAULT_CONFIG
+    opens = data["open"].to_numpy()
+    highs = data["high"].to_numpy()
+    lows = data["low"].to_numpy()
+    closes = data["close"].to_numpy()
+    points: list[dict[str, Any]] = []
 
-    overlap = overlap_high - overlap_low
-    smaller_height = min(left["high"] - left["low"], right["high"] - right["low"])
-    if smaller_height <= 0:
-        return 0.0
-    return overlap / smaller_height
+    for i in range(len(data)):
+        body = abs(closes[i] - opens[i]) or 1e-9
+        upper_wick = highs[i] - max(opens[i], closes[i])
+        lower_wick = min(opens[i], closes[i]) - lows[i]
+        atr_value = float(atr.iloc[i])
+
+        if upper_wick >= body * config.sweep_wick_body_ratio:
+            points.append(
+                _liquidity_point(
+                    float(highs[i]),
+                    i,
+                    atr_value,
+                    "swing_high",
+                    "corrective",
+                    "wick",
+                )
+            )
+
+        if lower_wick >= body * config.sweep_wick_body_ratio:
+            points.append(
+                _liquidity_point(
+                    float(lows[i]),
+                    i,
+                    atr_value,
+                    "swing_low",
+                    "corrective",
+                    "wick",
+                )
+            )
+
+    return points
 
 
-def _merge_two_zones(current: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(current)
-    merged["low"] = min(current["low"], candidate["low"])
-    merged["high"] = max(current["high"], candidate["high"])
-    merged["center"] = (merged["low"] + merged["high"]) / 2.0
-    merged["_atr"] = max(current["_atr"], candidate["_atr"])
-    merged["_index"] = min(current["_index"], candidate["_index"])
-    return merged
+def _collect_equal_level_points(data: pd.DataFrame, atr: pd.Series) -> list[dict[str, Any]]:
+    config = DEFAULT_CONFIG
+    highs = data["high"].to_numpy()
+    lows = data["low"].to_numpy()
+    points: list[dict[str, Any]] = []
+
+    for i in range(len(data)):
+        atr_value = float(atr.iloc[i])
+        tol = atr_value * config.micro_equal_level_atr
+
+        for j in range(max(0, i - 12), min(len(data), i + 12)):
+            if j == i:
+                continue
+            if abs(highs[j] - highs[i]) <= tol:
+                points.append(
+                    _liquidity_point(
+                        float(highs[i]),
+                        i,
+                        atr_value,
+                        "swing_high",
+                        "corrective",
+                        "equal_high",
+                    )
+                )
+                break
+
+        for j in range(max(0, i - 12), min(len(data), i + 12)):
+            if j == i:
+                continue
+            if abs(lows[j] - lows[i]) <= tol:
+                points.append(
+                    _liquidity_point(
+                        float(lows[i]),
+                        i,
+                        atr_value,
+                        "swing_low",
+                        "corrective",
+                        "equal_low",
+                    )
+                )
+                break
+
+    return points
 
 
-def _can_merge_zones(
-    current: dict[str, Any],
-    candidate: dict[str, Any],
+def _cluster_points(
+    points: list[dict[str, Any]],
+    cluster_mult: float,
+    min_points: int | None = None,
+) -> list[list[dict[str, Any]]]:
+    if not points:
+        return []
+
+    config = DEFAULT_CONFIG
+    required = config.cluster_min_points if min_points is None else min_points
+    ordered = sorted(points, key=lambda item: (item["price"], item["index"]))
+    clusters: list[list[dict[str, Any]]] = []
+    current = [ordered[0]]
+
+    for point in ordered[1:]:
+        ref_atr = max(member["_atr"] for member in current)
+        threshold = ref_atr * cluster_mult
+        if abs(point["price"] - current[-1]["price"]) <= threshold:
+            current.append(point)
+            continue
+
+        if len(current) >= required:
+            clusters.append(current)
+        current = [point]
+
+    if len(current) >= required:
+        clusters.append(current)
+
+    return clusters
+
+
+def _dominant(values: list[str]) -> str:
+    return max(set(values), key=values.count)
+
+
+def _zone_from_cluster(cluster: list[dict[str, Any]], level: str) -> dict[str, Any]:
+    prices = [point["price"] for point in cluster]
+    indices = [point["index"] for point in cluster]
+    atr_value = sum(point["_atr"] for point in cluster) / len(cluster)
+    center = sum(prices) / len(prices)
+    idx = min(indices)
+    half = max(atr_value * LEVEL_ZONE_K.get(level, DEFAULT_CONFIG.zone_k), (max(prices) - min(prices)) / 2.0)
+
+    return {
+        "low": center - half,
+        "high": center + half,
+        "center": center,
+        "strength": 0,
+        "type": _dominant([point["_leg_type"] for point in cluster]),
+        "level": level,
+        "level_rank": ZONE_LEVELS[level],
+        "touch_count": 0,
+        "sweep_count": 0,
+        "source": "cluster",
+        "cluster_point_count": len(cluster),
+        "_atr": atr_value,
+        "_index": idx,
+        "_leg_type": _dominant([point["_leg_type"] for point in cluster]),
+        "_swing_type": _dominant([point["_swing_type"] for point in cluster]),
+    }
+
+
+def _collect_range_boundaries(data: pd.DataFrame, atr: pd.Series) -> list[dict[str, Any]]:
+    """Major range boundaries as macro liquidity anchors."""
+    config = DEFAULT_CONFIG
+    window = min(80, len(data))
+    if window < 10:
+        return []
+
+    highs = data["high"].to_numpy()
+    lows = data["low"].to_numpy()
+    start = len(data) - window
+    idx = len(data) - 1
+    atr_value = float(atr.iloc[idx])
+    range_high = float(highs[start:].max())
+    range_low = float(lows[start:].min())
+
+    return [
+        _liquidity_point(range_high, idx, atr_value, "swing_high", "impulsive", "range"),
+        _liquidity_point(range_low, idx, atr_value, "swing_low", "impulsive", "range"),
+        _liquidity_point((range_high + range_low) / 2.0, idx, atr_value, "swing_low", "corrective", "range"),
+    ]
+
+
+def _collect_reaction_points(data: pd.DataFrame, atr: pd.Series) -> list[dict[str, Any]]:
+    config = DEFAULT_CONFIG
+    opens = data["open"].to_numpy()
+    highs = data["high"].to_numpy()
+    lows = data["low"].to_numpy()
+    closes = data["close"].to_numpy()
+    points: list[dict[str, Any]] = []
+
+    for i in range(1, len(data)):
+        body = abs(closes[i] - opens[i]) or 1e-9
+        upper_wick = highs[i] - max(opens[i], closes[i])
+        lower_wick = min(opens[i], closes[i]) - lows[i]
+        atr_value = float(atr.iloc[i])
+
+        if upper_wick >= body * 0.8 or lower_wick >= body * 0.8:
+            price = float(highs[i] if upper_wick >= lower_wick else lows[i])
+            points.append(
+                _liquidity_point(
+                    price,
+                    i,
+                    atr_value,
+                    "swing_high" if upper_wick >= lower_wick else "swing_low",
+                    "corrective",
+                    "reaction",
+                )
+            )
+
+    return points
+
+
+def _generate_macro_zones(
+    swings: list[dict[str, Any]],
+    atr: pd.Series,
+    data: pd.DataFrame | None = None,
+) -> list[dict[str, Any]]:
+    config = DEFAULT_CONFIG
+    points = _collect_swing_points(swings, atr, config.macro_swing_atr)
+    if data is not None:
+        points.extend(_collect_range_boundaries(data, atr))
+    clusters = _cluster_points(points, config.cluster_atr_mult * 2.0, min_points=1)
+    return [_zone_from_cluster(cluster, "macro") for cluster in clusters]
+
+
+def _generate_mid_zones(
+    data: pd.DataFrame,
+    swings: list[dict[str, Any]],
+    atr: pd.Series,
+    macro_zones: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    config = DEFAULT_CONFIG
+    points = _collect_swing_points(swings, atr, config.mid_swing_atr * 0.5)
+    points.extend(_collect_reaction_points(data, atr))
+
+    if macro_zones:
+        filtered: list[dict[str, Any]] = []
+        for point in points:
+            inside_macro = any(
+                macro["low"] <= point["price"] <= macro["high"] for macro in macro_zones
+            )
+            if inside_macro:
+                filtered.append(point)
+        points = filtered
+
+    clusters = _cluster_points(points, config.cluster_atr_mult * 1.5, min_points=1)
+    return [_zone_from_cluster(cluster, "mid") for cluster in clusters]
+
+
+def _generate_micro_zones(data: pd.DataFrame, atr: pd.Series) -> list[dict[str, Any]]:
+    config = DEFAULT_CONFIG
+    points = _collect_wick_points(data, atr) + _collect_equal_level_points(data, atr)
+    clusters = _cluster_points(
+        points,
+        config.cluster_atr_mult,
+        min_points=config.micro_cluster_min_points,
+    )
+    return [_zone_from_cluster(cluster, "micro") for cluster in clusters]
+
+
+def _can_merge_same_level(
+    left: dict[str, Any],
+    right: dict[str, Any],
     data: pd.DataFrame,
     swings: list[dict[str, Any]],
     atr: pd.Series,
 ) -> bool:
-    if current["_leg_type"] != candidate["_leg_type"]:
+    if left.get("level") != right.get("level"):
+        return False
+    if left["_leg_type"] != right["_leg_type"]:
+        return False
+    if left["_swing_type"] != right["_swing_type"]:
+        return False
+    if has_break_of_structure(data, left["_index"], right["_index"], swings, atr=atr):
         return False
 
-    if has_break_of_structure(
-        data,
-        current["_index"],
-        candidate["_index"],
-        swings,
-        atr=atr,
-    ):
-        return False
-
-    overlap = _zone_overlap_ratio(current, candidate)
-    if overlap > DEFAULT_CONFIG.zone_overlap_merge_pct:
-        return True
-
-    reference_atr = max(current["_atr"], candidate["_atr"])
-    distance = abs(candidate["center"] - current["center"])
-    return distance <= reference_atr * DEFAULT_CONFIG.zone_merge_atr
+    reference_atr = max(left["_atr"], right["_atr"])
+    distance = abs(left["center"] - right["center"])
+    return distance <= reference_atr * DEFAULT_CONFIG.same_level_merge_atr
 
 
-def _compress_zone_group(
+def _merge_within_level(
     zones: list[dict[str, Any]],
     data: pd.DataFrame,
     swings: list[dict[str, Any]],
@@ -119,17 +426,24 @@ def _compress_zone_group(
         for i in range(len(result)):
             if consumed[i]:
                 continue
-
             current = dict(result[i])
             for j in range(i + 1, len(result)):
                 if consumed[j]:
                     continue
                 candidate = result[j]
-                if _can_merge_zones(current, candidate, data, swings, atr):
-                    current = _merge_two_zones(current, candidate)
+                if _can_merge_same_level(current, candidate, data, swings, atr):
+                    current["low"] = min(current["low"], candidate["low"])
+                    current["high"] = max(current["high"], candidate["high"])
+                    current["center"] = (current["low"] + current["high"]) / 2.0
+                    current["_atr"] = max(current["_atr"], candidate["_atr"])
+                    current["_index"] = min(current["_index"], candidate["_index"])
+                    current["source"] = "cluster"
+                    current["cluster_point_count"] = int(
+                        current.get("cluster_point_count", 1)
+                        + candidate.get("cluster_point_count", 1)
+                    )
                     consumed[j] = True
                     merged_any = True
-
             next_result.append(current)
 
         result = next_result
@@ -138,80 +452,36 @@ def _compress_zone_group(
     return result
 
 
-def _cluster_zones(
-    zones: list[dict[str, Any]],
-    data: pd.DataFrame,
-    swings: list[dict[str, Any]],
-    atr: pd.Series,
-) -> list[dict[str, Any]]:
-    if not zones:
-        return []
+def _assign_nesting(grouped: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
+    """Link mid zones to macro parents and micro zones to mid/macro parents."""
+    for level, zones in grouped.items():
+        for zone in zones:
+            zone["parent_macro"] = None
+            zone["parent_mid"] = None
 
-    merged: list[dict[str, Any]] = []
-    for leg_type in ("impulsive", "corrective"):
-        for swing_type in ("swing_high", "swing_low"):
-            group = [
-                zone
-                for zone in zones
-                if zone["_leg_type"] == leg_type and zone["_swing_type"] == swing_type
-            ]
-            if not group:
-                continue
-            merged.extend(
-                _compress_zone_group(
-                    sorted(group, key=lambda zone: zone["_index"]),
-                    data,
-                    swings,
-                    atr,
-                )
-            )
+    for mid in grouped["mid"]:
+        for macro in grouped["macro"]:
+            if mid["low"] >= macro["low"] and mid["high"] <= macro["high"]:
+                mid["parent_macro"] = macro["center"]
+                break
 
-    merged.sort(key=lambda zone: zone["_index"])
-    return merged
+    for micro in grouped["micro"]:
+        for mid in grouped["mid"]:
+            if micro["low"] >= mid["low"] and micro["high"] <= mid["high"]:
+                micro["parent_mid"] = mid["center"]
+                break
+        if micro["parent_mid"] is None:
+            for macro in grouped["macro"]:
+                if micro["low"] >= macro["low"] and micro["high"] <= macro["high"]:
+                    micro["parent_macro"] = macro["center"]
+                    break
 
-
-def _split_oversized_zones(
-    zones: list[dict[str, Any]],
-    swings: list[dict[str, Any]],
-    atr: pd.Series,
-    zone_k: float,
-) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-
-    for zone in zones:
-        height = zone["high"] - zone["low"]
-        max_height = zone["_atr"] * DEFAULT_CONFIG.max_zone_height_atr
-
-        if height <= max_height:
-            result.append(zone)
-            continue
-
-        inner_swings = [
-            s
-            for s in swings
-            if zone["low"] <= s["price"] <= zone["high"]
-            and s.get("leg_type", "corrective") == zone["_leg_type"]
-        ]
-
-        if len(inner_swings) < 2:
-            half_height = height / 4.0
-            for sub_center in (zone["low"] + half_height, zone["high"] - half_height):
-                sub = dict(zone)
-                sub["low"] = sub_center - half_height / 2.0
-                sub["high"] = sub_center + half_height / 2.0
-                sub["center"] = sub_center
-                result.append(sub)
-            continue
-
-        result.extend(_build_raw_zones(inner_swings, atr, zone_k=zone_k))
-
-    return result
+    return grouped
 
 
 def _count_touch_events(data: pd.DataFrame, zone: dict[str, Any]) -> int:
     highs = data["high"].to_numpy()
     lows = data["low"].to_numpy()
-
     touches = 0
     in_zone = False
 
@@ -231,7 +501,6 @@ def _count_zone_interactions(
     zone: dict[str, Any],
     atr: pd.Series,
 ) -> tuple[int, int, int]:
-    """Return touch_count, rejection_count, displacement_score."""
     opens = data["open"].to_numpy()
     highs = data["high"].to_numpy()
     lows = data["low"].to_numpy()
@@ -299,13 +568,82 @@ def _normalize_strength(raw_scores: list[float]) -> list[int]:
     return [min(95, max(15, value)) for value in normalized]
 
 
+def _last_touch_bar(data: pd.DataFrame, zone: dict[str, Any]) -> int:
+    highs = data["high"].to_numpy()
+    lows = data["low"].to_numpy()
+    last_touch = -1
+
+    for i in range(len(data)):
+        if lows[i] <= zone["high"] and highs[i] >= zone["low"]:
+            last_touch = i
+
+    return last_touch
+
+
+def _last_activity_bar(
+    data: pd.DataFrame,
+    zone_index: int,
+    sweeps: list[dict[str, Any]],
+    zone: dict[str, Any],
+) -> int:
+    last_touch = _last_touch_bar(data, zone)
+    last_sweep = -1
+    for sweep in sweeps:
+        if sweep.get("zone_index") == zone_index:
+            last_sweep = max(last_sweep, int(sweep.get("bar_index", -1)))
+    return max(last_touch, last_sweep)
+
+
+def filter_tradable_zones(
+    data: pd.DataFrame,
+    zones: list[dict[str, Any]],
+    sweeps: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Keep only zones with proven liquidity activity:
+    - minimum touches on price
+    - at least one real sweep
+    - recent activity within max_inactive_bars
+    """
+    config = DEFAULT_CONFIG
+    kept: list[dict[str, Any]] = []
+    index_map: dict[int, int] = {}
+
+    for zone_index, zone in enumerate(zones):
+        if zone.get("touch_count", 0) < config.min_zone_touches:
+            continue
+        if zone.get("sweep_count", 0) < config.min_zone_sweeps:
+            continue
+
+        last_activity = _last_activity_bar(data, zone_index, sweeps, zone)
+        if last_activity < 0:
+            continue
+
+        bars_since = (len(data) - 1) - last_activity
+        if bars_since > config.max_inactive_bars:
+            continue
+
+        index_map[zone_index] = len(kept)
+        kept.append(zone)
+
+    remapped_sweeps: list[dict[str, Any]] = []
+    for sweep in sweeps:
+        old_index = sweep.get("zone_index")
+        if old_index not in index_map:
+            continue
+        item = dict(sweep)
+        item["zone_index"] = index_map[old_index]
+        remapped_sweeps.append(item)
+
+    return kept, remapped_sweeps
+
+
 def finalize_zones(
     data: pd.DataFrame,
     zones: list[dict[str, Any]],
     sweeps: list[dict[str, Any]],
     atr: pd.Series,
 ) -> list[dict[str, Any]]:
-    """Compute touch/sweep counts and normalized strength for output zones."""
     config = DEFAULT_CONFIG
     sweep_counts: dict[int, int] = {}
     for sweep in sweeps:
@@ -335,7 +673,6 @@ def finalize_zones(
                 "sweep_count": sweep_count,
                 "_rejection_count": rejection_count,
                 "_displacement_score": displacement_score,
-                "_time_score": time_score,
                 "_raw_strength": float(raw_score),
             }
         )
@@ -351,121 +688,65 @@ def finalize_zones(
                 "center": float(zone["center"]),
                 "strength": strength,
                 "type": zone["type"],
+                "level": zone.get("level", "mid"),
+                "level_rank": zone.get("level_rank", ZONE_LEVELS.get(zone.get("level", "mid"), 2)),
                 "touch_count": int(zone["touch_count"]),
                 "sweep_count": int(zone["sweep_count"]),
-                "_displacement_score": int(zone["_displacement_score"]),
+                "source": zone.get("source", "cluster"),
+                "cluster_point_count": int(zone.get("cluster_point_count", 0)),
+                "parent_macro": zone.get("parent_macro"),
+                "parent_mid": zone.get("parent_mid"),
             }
         )
 
     return output
 
 
-def _passes_quality_gate(zone: dict[str, Any]) -> bool:
-    if zone["touch_count"] >= 2:
-        return True
-    if zone.get("_displacement_score", 0) > 0:
-        return True
-    if zone["sweep_count"] > 0:
-        return True
-    return False
-
-
-def filter_quality_zones(
-    zones: list[dict[str, Any]],
-    sweeps: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Remove noise zones and remap sweep indices to the compressed set."""
-    config = DEFAULT_CONFIG
-    kept: list[dict[str, Any]] = []
-    index_map: dict[int, int] = {}
-
-    for old_index, zone in enumerate(zones):
-        retested = zone["touch_count"] >= 2
-        if zone["strength"] < config.min_zone_strength and not retested:
-            continue
-        if not _passes_quality_gate(zone):
-            continue
-
-        cleaned = {
-            key: value for key, value in zone.items() if not key.startswith("_")
-        }
-        index_map[old_index] = len(kept)
-        kept.append(cleaned)
-
-    remapped_sweeps: list[dict[str, Any]] = []
-    for sweep in sweeps:
-        old_index = sweep["zone_index"]
-        if old_index not in index_map:
-            continue
-        remapped_sweeps.append({**sweep, "zone_index": index_map[old_index]})
-
-    return kept, remapped_sweeps
-
-
-def _remove_redundant_overlaps(zones: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not zones:
-        return []
-
-    ranked = sorted(zones, key=lambda zone: (zone["strength"], zone["touch_count"]), reverse=True)
-    kept: list[dict[str, Any]] = []
-
-    for candidate in ranked:
-        redundant = False
-        for existing in kept:
-            if (
-                existing["type"] == candidate["type"]
-                and _zone_overlap_ratio(existing, candidate) > DEFAULT_CONFIG.zone_overlap_merge_pct
-                and existing["strength"] >= candidate["strength"]
-            ):
-                redundant = True
-                break
-        if not redundant:
-            kept.append(candidate)
-
-    kept.sort(key=lambda zone: zone["center"])
-    return kept
-
-
-def tag_sub_zones(zones: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Mark nested zones as sub-zones and collapse them from primary output."""
-    tagged = [dict(zone) for zone in zones]
-
-    for i, child in enumerate(tagged):
-        child_area = child["high"] - child["low"]
-        for j, parent in enumerate(tagged):
-            if i == j:
-                continue
-
-            parent_area = parent["high"] - parent["low"]
-            contained = (
-                child["low"] >= parent["low"]
-                and child["high"] <= parent["high"]
-                and parent_area > child_area
-            )
-            if contained and parent["strength"] >= child["strength"]:
-                child["role"] = "sub-zone"
-                break
-
-    return [zone for zone in tagged if zone.get("role") != "sub-zone"]
-
-
-def _prepare_zone_candidates(
+def build_fractal_zone_map(
     data: pd.DataFrame,
+    swings: list[dict[str, Any]],
     atr: pd.Series,
-    swing_points: list[dict[str, Any]],
-    zone_k: float,
-    cluster_atr_mult: float,
-) -> list[dict[str, Any]]:
-    del cluster_atr_mult  # compression uses config.zone_merge_atr
+) -> dict[str, list[dict[str, Any]]]:
+    """Build nested macro / mid / micro zone layers without cross-level merging."""
+    macro = _merge_within_level(_generate_macro_zones(swings, atr, data), data, swings, atr)
+    mid = _merge_within_level(
+        _generate_mid_zones(data, swings, atr, macro), data, swings, atr
+    )
+    micro = _merge_within_level(_generate_micro_zones(data, atr), data, swings, atr)
 
-    raw_zones = _build_raw_zones(swing_points, atr, zone_k=zone_k)
-    clustered = _cluster_zones(raw_zones, data, swing_points, atr)
-    split = _split_oversized_zones(clustered, swing_points, atr, zone_k=zone_k)
+    grouped = {"macro": macro, "mid": mid, "micro": micro}
+    return _assign_nesting(grouped)
 
-    if len(split) != len(clustered):
-        split = _cluster_zones(split, data, swing_points, atr)
 
-    return split
+def _zone_overlap_ratio(left: dict[str, Any], right: dict[str, Any]) -> float:
+    overlap_low = max(left["low"], right["low"])
+    overlap_high = min(left["high"], right["high"])
+    if overlap_high <= overlap_low:
+        return 0.0
+    overlap = overlap_high - overlap_low
+    smaller_height = min(left["high"] - left["low"], right["high"] - right["low"])
+    if smaller_height <= 0:
+        return 0.0
+    return overlap / smaller_height
+
+
+def has_nested_overlap(grouped: dict[str, list[dict[str, Any]]]) -> bool:
+    """Return True when mid/micro layers nest inside macro/mid zones."""
+    if not grouped["macro"] or not grouped["mid"]:
+        return False
+
+    mid_in_macro = any(
+        any(
+            mid["low"] >= macro["low"] and mid["high"] <= macro["high"]
+            for macro in grouped["macro"]
+        )
+        for mid in grouped["mid"]
+    )
+    micro_nested = any(
+        zone.get("parent_mid") is not None or zone.get("parent_macro") is not None
+        for zone in grouped["micro"]
+    )
+    return mid_in_macro or micro_nested
 
 
 def build_zones(
@@ -476,12 +757,7 @@ def build_zones(
     cluster_atr_mult: float = DEFAULT_CONFIG.cluster_atr_mult,
     swings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """
-    Build clustered liquidity zones around swing points.
-
-    Zone width: swing_price +/- (ATR * zone_k)
-    Structure-aware compression preserves separate impulsive/corrective legs.
-    """
+    """Build fractal zones and return flattened list (backward-compatible API)."""
     EngineConfig(
         swing_window=swing_window,
         atr_period=atr_period,
@@ -493,10 +769,10 @@ def build_zones(
     atr = compute_atr(data, period=atr_period)
     swing_points = swings if swings is not None else detect_swings(data, swing_window=swing_window)
 
-    candidates = _prepare_zone_candidates(
-        data, atr, swing_points, zone_k=zone_k, cluster_atr_mult=cluster_atr_mult
-    )
-    finalized = finalize_zones(data, candidates, sweeps=[], atr=atr)
-    filtered, _ = filter_quality_zones(finalized, [])
-    deduped = _remove_redundant_overlaps(filtered)
-    return tag_sub_zones(deduped)
+    grouped = build_fractal_zone_map(data, swing_points, atr)
+    flat = flatten_zone_map(grouped)
+    prelim = finalize_zones(data, flat, sweeps=[], atr=atr)
+    sweeps = detect_sweeps(df, prelim)
+    finalized = finalize_zones(data, prelim, sweeps, atr=atr)
+    tradable, _ = filter_tradable_zones(data, finalized, sweeps)
+    return tradable

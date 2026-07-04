@@ -7,17 +7,48 @@ from typing import Any
 import pandas as pd
 
 from liquidity_zone_engine.atr import compute_atr
+from liquidity_zone_engine.bias import compute_daily_bias
+from liquidity_zone_engine.bos_choch import detect_bos_choch_timeline
+from liquidity_zone_engine.broker_time import validate_broker_timezone
 from liquidity_zone_engine.config import DEFAULT_CONFIG, SUPPORTED_TIMEFRAMES
-from liquidity_zone_engine.structure import detect_swings
+from liquidity_zone_engine.fvg import detect_fvgs, find_fvg_retest_after_sweep
+from liquidity_zone_engine.lit_calibrate import calibrate_lit_output
+from liquidity_zone_engine.sessions import analyze_session_liquidity
+from liquidity_zone_engine.structure import annotate_liquidity_roles, detect_swings
 from liquidity_zone_engine.sweeps import detect_sweeps
 from liquidity_zone_engine.utils import normalize_ohlc
 from liquidity_zone_engine.zones import (
-    _prepare_zone_candidates,
-    _remove_redundant_overlaps,
-    filter_quality_zones,
+    build_fractal_zone_map,
     finalize_zones,
-    tag_sub_zones,
+    flatten_zone_map,
+    regroup_zones,
 )
+
+
+def _enrich_sweeps_with_fvg(
+    data: pd.DataFrame,
+    sweeps: list[dict[str, Any]],
+    fvgs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    enriched: list[dict[str, Any]] = []
+
+    for sweep in sweeps:
+        item = dict(sweep)
+        setup_type = "buy" if sweep["type"] == "sell_side_sweep" else "sell"
+        bar_index = int(sweep.get("bar_index", -1))
+
+        poi = find_fvg_retest_after_sweep(data, bar_index, setup_type, fvgs)
+        item["fvg_poi_valid"] = poi is not None
+        if poi is not None:
+            item["fvg_poi"] = {
+                "type": poi["type"],
+                "low": poi["low"],
+                "high": poi["high"],
+                "index": poi["index"],
+            }
+        enriched.append(item)
+
+    return enriched
 
 
 def full_analysis(
@@ -30,10 +61,10 @@ def full_analysis(
     timeframe: str | None = None,
 ) -> dict[str, Any]:
     """
-    Run full liquidity intelligence analysis on a pre-loaded OHLC dataframe.
+    Run LIT liquidity intelligence analysis with calibrated dashboard output.
 
-    This function does not fetch market data. Pass D1/H4/H1/M15/M5 dataframes
-    from your existing MT5 data loader.
+    Returns regime/bias, max 5 H1 zones, filtered sweeps, BOS/CHOCH, targets,
+    and 2 trade scenarios.
     """
     if timeframe is not None and timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError(
@@ -41,38 +72,63 @@ def full_analysis(
             f"Supported values: {', '.join(SUPPORTED_TIMEFRAMES)}"
         )
 
-    swings = detect_swings(df, swing_window=swing_window)
     data = normalize_ohlc(df)
+    validate_broker_timezone(data)
     atr = compute_atr(data, period=atr_period)
 
-    candidates = _prepare_zone_candidates(
+    swings = detect_swings(df, swing_window=swing_window)
+    fvgs = detect_fvgs(data, atr_period=atr_period)
+    session = analyze_session_liquidity(data)
+    daily_bias = compute_daily_bias(data, fvgs=fvgs)
+
+    grouped_raw = build_fractal_zone_map(data, swings, atr)
+    flat_raw = flatten_zone_map(grouped_raw)
+    prelim = finalize_zones(data, flat_raw, sweeps=[], atr=atr)
+
+    sweeps = detect_sweeps(df, prelim)
+    sweeps = _enrich_sweeps_with_fvg(data, sweeps, fvgs)
+
+    bos_timeline = detect_bos_choch_timeline(data, swings)
+    lit = calibrate_lit_output(
         data,
-        atr,
         swings,
-        zone_k=zone_k,
-        cluster_atr_mult=cluster_atr_mult,
+        regroup_zones(finalize_zones(data, prelim, sweeps, atr)),
+        sweeps,
+        bos_timeline,
+        timeframe=timeframe,
     )
 
-    prelim = finalize_zones(data, candidates, sweeps=[], atr=atr)
-    quality_zones, _ = filter_quality_zones(prelim, [])
-    quality_zones = _remove_redundant_overlaps(quality_zones)
-
-    sweeps = detect_sweeps(df, quality_zones)
-    zones = finalize_zones(data, quality_zones, sweeps, atr)
-    zones = [
-        {key: value for key, value in zone.items() if not key.startswith("_")}
-        for zone in zones
-    ]
-    zones = tag_sub_zones(_remove_redundant_overlaps(zones))
-
-    if timeframe in ("D1", "H4"):
-        for zone in zones:
-            zone.pop("role", None)
+    flat_zones = lit["zones"]
+    swings = annotate_liquidity_roles(swings, lit["sweeps"], flat_zones)
 
     result: dict[str, Any] = {
-        "zones": zones,
+        "market_summary": lit["market_summary"],
+        "liquidity_targets": lit["liquidity_targets"],
+        "liquidity_pools": lit["liquidity_pools"],
+        "zones": lit["zones_grouped"],
+        "zones_flat": lit["zones"],
+        "sweeps": lit["sweeps"],
         "swings": swings,
-        "sweeps": sweeps,
+        "bos_choch": lit["bos_choch"],
+        "trade_scenarios": lit["trade_scenarios"],
+        "fvgs": [
+            {
+                "type": fvg["type"],
+                "low": fvg["low"],
+                "high": fvg["high"],
+                "center": fvg["center"],
+                "index": fvg["index"],
+                "timestamp": fvg["timestamp"],
+                "filled": fvg["filled"],
+            }
+            for fvg in fvgs
+        ],
+        "session": session,
+        "daily_bias": daily_bias,
+        "validation": {
+            "zones_before": len(flat_raw),
+            **lit["validation"],
+        },
     }
 
     if timeframe is not None:

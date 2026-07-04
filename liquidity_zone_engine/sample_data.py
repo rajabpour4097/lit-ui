@@ -5,6 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from liquidity_zone_engine.broker_time import stamp_broker_metadata
+
 
 def load_sample_data(bars: int = 120) -> pd.DataFrame:
     """Build deterministic OHLC data with visible swings and sweep scenarios."""
@@ -54,4 +56,4 @@ def load_sample_data(bars: int = 120) -> pd.DataFrame:
 
     df = pd.DataFrame(rows, index=timestamps)
     df["timestamp"] = df.index
-    return df
+    return stamp_broker_metadata(df, validated=True)

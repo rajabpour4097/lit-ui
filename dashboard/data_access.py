@@ -5,6 +5,11 @@ from __future__ import annotations
 import pandas as pd
 from django.conf import settings
 
+from liquidity_zone_engine.broker_time import (
+    stamp_broker_metadata,
+    verify_mt5_broker_offset_session,
+)
+
 TIMEFRAME_TO_MT5 = {
     "M5": 5,
     "M15": 15,
@@ -44,7 +49,22 @@ def get_ohlc_data(symbol: str, timeframe: str, bars: int | None = None) -> pd.Da
 
         df = pd.DataFrame(rates)
         df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True)
-        return df[["open", "high", "low", "close", "timestamp"]].copy()
+        df = df[["open", "high", "low", "close", "timestamp"]].copy()
+
+        expected_offset = getattr(settings, "BROKER_UTC_OFFSET_HOURS", 3)
+        last_bar = pd.Timestamp(df["timestamp"].iloc[-1]).to_pydatetime()
+        verification = verify_mt5_broker_offset_session(
+            mt5,
+            symbol,
+            last_bar_utc=last_bar,
+            expected_offset_hours=expected_offset,
+        )
+        return stamp_broker_metadata(
+            df,
+            offset_hours=expected_offset,
+            validated=True,
+            verification=verification,
+        )
     finally:
         mt5.shutdown()
 
